@@ -1,0 +1,235 @@
+name: win 11 ARM + tailscale
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # لحفظ البيانات في branch اسمه rdp-data
+  actions: write    # لإعادة تشغيل الـ workflow تلقائيا
+
+jobs:
+  secure-rdp:
+    runs-on: windows-11-arm
+    timeout-minutes: 360
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      # المشروع الخاص لحفظ البيانات (غيّره إذا كان اسمه مختلفا)
+      DATA_REPO: marayam12/renexa-data
+      DATA_TOKEN: ${{ secrets.DATA_TOKEN }}
+      # برامج تُثبَّت تلقائيا كل جلسة (أسماء حزم Chocolatey) مفصولة بفاصلة
+      APPS: "googlechrome,7zip,vlc"
+      # مجلدات إضافية تُحفظ (داخل C:\Users\RDP). Apps = مجلد لبرامجك المحمولة
+      APP_DATA_FOLDERS: 'Apps,AppData\Roaming,AppData\Local\Programs,AppData\Local\Discord'
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Enable Audio over RDP
+        continue-on-error: true
+        run: |
+          # تشغيل خدمات الصوت (معطلة افتراضيا على السيرفر)
+          foreach ($s in "AudioEndpointBuilder","Audiosrv") {
+              Set-Service -Name $s -StartupType Automatic
+              Start-Service -Name $s
+          }
+          # السماح بتحويل الصوت عبر RDP (تشغيل + ميكروفون)
+          $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $ts -Force | Out-Null
+          Set-ItemProperty -Path $ts -Name fDisableAudioCapture -Value 0 -Type DWord
+          Get-Service AudioEndpointBuilder, Audiosrv | Format-Table Name, Status
+
+      - name: Create RDP User
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $password = $env:RDP_PASSWORD
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-arm64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=Renexa
+
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Install apps (Chocolatey)
+        continue-on-error: true
+        run: |
+          foreach ($a in ($env:APPS -split ',')) {
+              if ($a) { choco install $a -y --no-progress }
+          }
+
+      - name: Prepare backup script
+        run: |
+          @'
+          $zip = "$env:RUNNER_TEMP\backup.zip"
+          Remove-Item $zip -Force -ErrorAction SilentlyContinue
+          $src = "C:\Users\RDP"
+          $stage = "$env:RUNNER_TEMP\stage"
+          Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory $stage | Out-Null
+
+          $folders = @("Desktop","Documents","Downloads","Pictures","Videos","Music") +
+                     ($env:APP_DATA_FOLDERS -split ',' | Where-Object { $_ })
+          foreach ($f in $folders) {
+              if (Test-Path "$src\$f") {
+                  robocopy "$src\$f" "$stage\$f" /E /R:0 /W:0 /NFL /NDL /NJH /NJS /NP `
+                    /XD Cache "Code Cache" GPUCache Crashpad "Service Worker" "Component_CRX_Cache" CachedData Temp Microsoft | Out-Null
+              }
+          }
+          $global:LASTEXITCODE = 0
+
+          tar -a -c -f $zip -C $stage .
+          $global:LASTEXITCODE = 0
+          if (-not (Test-Path $zip)) { Write-Host "No zip created"; exit 0 }
+
+          $mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          if ($mb -gt 1900) { Write-Host "Backup is $mb MB (limit ~2000 MB) - skipped"; exit 0 }
+
+          $env:GH_TOKEN = $env:DATA_TOKEN
+          gh release view data --repo $env:DATA_REPO *> $null
+          if ($LASTEXITCODE -ne 0) {
+              # المشروع الفارغ يحتاج commit واحد قبل إنشاء release
+              $d = "$env:RUNNER_TEMP\datarepo"
+              Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
+              New-Item -ItemType Directory $d | Out-Null
+              Push-Location $d
+              "renexa data" | Set-Content README.md
+              git init -q
+              git config user.name "rdp-bot"
+              git config user.email "rdp-bot@users.noreply.github.com"
+              git checkout -q -b rdp-data
+              git add README.md
+              git commit -q -m init
+              git remote add origin "https://x-access-token:$($env:DATA_TOKEN)@github.com/$($env:DATA_REPO).git"
+              git push -q --force origin rdp-data
+              Pop-Location
+              gh release create data --repo $env:DATA_REPO --target rdp-data --title data --notes "backup storage"
+          }
+          gh release upload data $zip --repo $env:DATA_REPO --clobber
+          Write-Host "Backup uploaded ($mb MB) to release data"
+          '@ | Set-Content -Path "$env:RUNNER_TEMP\backup.ps1" -Encoding UTF8
+
+      - name: Maintain Connection + Watch RDP User
+        timeout-minutes: 340
+        continue-on-error: true
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: the value of secret RDP_PASSWORD"
+          Write-Host "==================`n"
+
+          $rdpProfile = "C:\Users\RDP"
+          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+          $downloadPath = "$startupPath\Downloads.bat"
+
+          while ($true) {
+              if (Test-Path $rdpProfile) {
+                  try {
+                      # استعادة البيانات المحفوظة من المشروع الخاص
+                      $r = "$env:RUNNER_TEMP\restore"
+                      New-Item -ItemType Directory $r -Force | Out-Null
+                      $env:GH_TOKEN = $env:DATA_TOKEN
+                      gh release download data --repo $env:DATA_REPO --pattern backup.zip --dir $r --clobber 2>$null
+                      if (Test-Path "$r\backup.zip") {
+                          tar -xf "$r\backup.zip" -C $rdpProfile
+                          Write-Host "Data restored from private repo"
+                      } else {
+                          Write-Host "No previous backup found"
+                      }
+
+                      if (-not (Test-Path $startupPath)) {
+                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+                      }
+
+                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+                      Write-Host "Downloads.bat copied to $downloadPath"
+
+                      cmd /c $downloadPath
+                      Write-Host "Downloads.bat executed successfully"
+                      break
+                  }
+                  catch {
+                      Write-Host "Error: $($_.Exception.Message)"
+                      break
+                  }
+              }
+              else {
+                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
+                  Start-Sleep -Seconds 30
+              }
+          }
+
+          # Keep runner alive + نسخ احتياطي كل 30 دقيقة
+          $n = 0
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active"
+              Start-Sleep -Seconds 300
+              $n++
+              if ($n % 6 -eq 0) { & "$env:RUNNER_TEMP\backup.ps1" }
+          }
+
+      - name: Final backup
+        if: always()
+        run: '& "$env:RUNNER_TEMP\backup.ps1"'
+
+      - name: Restart workflow (new session)
+        if: ${{ !cancelled() }}
+        run: gh workflow run main.yml --ref ${{ github.ref_name }}
