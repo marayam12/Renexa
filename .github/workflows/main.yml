@@ -19,9 +19,9 @@ jobs:
       DATA_REPO: marayam12/renexa-data
       DATA_TOKEN: ${{ secrets.DATA_TOKEN }}
       # برامج تُثبَّت تلقائيا كل جلسة (أسماء حزم Chocolatey) مفصولة بفاصلة
-      APPS: "googlechrome,7zip,vlc,winrar"
+      APPS: "googlechrome,7zip,vlc,winrar,temurin21,minecraft-launcher"
       # مجلدات إضافية تُحفظ (داخل C:\Users\RDP). Apps = مجلد لبرامجك المحمولة
-      APP_DATA_FOLDERS: 'Apps,AppData\Roaming,AppData\Local\Programs,AppData\Local\Discord'
+      APP_DATA_FOLDERS: 'Apps,AppData\Roaming,AppData\Local\Programs'
 
     steps:
       - name: Configure Core RDP Settings
@@ -128,6 +128,24 @@ jobs:
               if ($a) { choco install $a -y --no-progress }
           }
 
+      - name: Install Mesa (software OpenGL - fake GPU)
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory C:\Mesa\dl -Force | Out-Null
+          gh release download --repo pal1000/mesa-dist-win --pattern "*release-msvc.7z" --dir C:\Mesa\dl --clobber
+          $z = Get-ChildItem C:\Mesa\dl -Filter *.7z | Select-Object -First 1
+          if (-not $z) { Write-Error "Mesa download failed"; exit 1 }
+          Write-Host "Mesa archive: $($z.Name)"
+          & "C:\Program Files\7-Zip\7z.exe" x $z.FullName "-oC:\Mesa\x" -y | Out-Null
+          $gl = Get-ChildItem C:\Mesa\x -Recurse -Filter opengl32.dll | Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+          if (-not $gl) { Write-Error "Mesa x64 opengl32.dll not found"; exit 1 }
+          New-Item -ItemType Directory C:\Mesa\x64 -Force | Out-Null
+          Copy-Item "$($gl.DirectoryName)\*.dll" C:\Mesa\x64 -Force
+          Get-ChildItem C:\Mesa\x64 | Format-Table Name, Length | Out-String | Write-Host
+          # إجبار Mesa على استخدام المعالج (llvmpipe) بدل كرت الشاشة
+          [Environment]::SetEnvironmentVariable('GALLIUM_DRIVER', 'llvmpipe', 'Machine')
+          Write-Host "Mesa ready"
+
       - name: Prepare backup script
         run: |
           @'
@@ -144,7 +162,8 @@ jobs:
           foreach ($f in $folders) {
               if (Test-Path "$src\$f") {
                   robocopy "$src\$f" "$stage\$f" /E /R:0 /W:0 /NFL /NDL /NJH /NJS /NP `
-                    /XD Cache "Code Cache" GPUCache Crashpad "Service Worker" "Component_CRX_Cache" CachedData Temp Microsoft | Out-Null
+                    /XD Cache "Code Cache" GPUCache Crashpad "Service Worker" "Component_CRX_Cache" CachedData Temp Microsoft `
+                    /XF opengl32.dll libgallium_wgl.dll libglapi.dll | Out-Null
               }
           }
           $global:LASTEXITCODE = 0
@@ -194,6 +213,26 @@ jobs:
           Write-Host "Password: the value of secret RDP_PASSWORD"
           Write-Host "==================`n"
 
+          # مراقب Mesa: ينسخ ملفات OpenGL الوهمية بجانب كل javaw.exe (Minecraft و Java) كل 20 ثانية
+          Start-Job -ScriptBlock {
+              $src = "C:\Mesa\x64"
+              $files = "opengl32.dll", "libgallium_wgl.dll", "libglapi.dll"
+              while ($true) {
+                  if (Test-Path "$src\opengl32.dll") {
+                      $found = @()
+                      $found += Get-ChildItem "C:\Users\RDP\AppData\Roaming\.minecraft\runtime" -Recurse -Filter javaw.exe -ErrorAction SilentlyContinue
+                      $found += Get-ChildItem "C:\Program Files\Eclipse Adoptium\*\bin\javaw.exe" -ErrorAction SilentlyContinue
+                      foreach ($j in $found) {
+                          foreach ($f in $files) {
+                              $t = Join-Path $j.DirectoryName $f
+                              if ((Test-Path "$src\$f") -and -not (Test-Path $t)) { Copy-Item "$src\$f" $t -Force -ErrorAction SilentlyContinue }
+                          }
+                      }
+                  }
+                  Start-Sleep -Seconds 20
+              }
+          } | Out-Null
+
           $rdpProfile = "C:\Users\RDP"
           $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
           $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
@@ -237,9 +276,10 @@ jobs:
                       $lines = @(
                         '$dl = "$env:TEMP\appdl"; New-Item -ItemType Directory $dl -Force | Out-Null',
                         'function Get-App($url, $name) { try { Invoke-WebRequest $url -OutFile "$dl\$name" -UseBasicParsing; return "$dl\$name" } catch { Write-Host "Download failed: $name"; return $null } }',
-                        'if (-not (Test-Path "$env:LOCALAPPDATA\Discord")) { $f = Get-App "https://discord.com/api/download?platform=win" "DiscordSetup.exe"; if ($f) { Start-Process $f -ArgumentList "-s" -Wait } }',
+                        'Remove-Item "$env:LOCALAPPDATA\Discord" -Recurse -Force -ErrorAction SilentlyContinue',
+                        '$f = Get-App "https://discord.com/api/download?platform=win" "DiscordSetup.exe"; if ($f) { Start-Process $f -ArgumentList "-s" -Wait }',
                         'if (-not (Test-Path "$env:APPDATA\Spotify\Spotify.exe")) { $f = Get-App "https://download.scdn.co/SpotifySetup.exe" "SpotifySetup.exe"; if ($f) { Start-Process $f -ArgumentList "/silent" -Wait } }',
-                        'if (-not (Test-Path "$env:LOCALAPPDATA\AnthropicClaude")) { $f = Get-App "https://claude.ai/api/desktop/win32/x64/setup/latest/redirect" "ClaudeSetup.exe"; if ($f) { Start-Process $f -ArgumentList "--silent" -Wait } }',
+                        'Set-Content -Path "$env:USERPROFILE\Desktop\Claude.url" -Value "[InternetShortcut]`nURL=https://claude.ai"',
                         'Set-Content -Path "$env:USERPROFILE\Desktop\WhatsApp Web.url" -Value "[InternetShortcut]`nURL=https://web.whatsapp.com"',
                         'Write-Host "apps done"'
                       )
