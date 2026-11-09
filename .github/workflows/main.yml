@@ -234,8 +234,18 @@ jobs:
               while ($true) {
                   if (Test-Path "$src\opengl32.dll") {
                       $found = @()
-                      $found += Get-ChildItem "C:\Users\RDP\AppData\Roaming\.minecraft\runtime" -Recurse -Filter javaw.exe -ErrorAction SilentlyContinue
-                      $found += Get-ChildItem "C:\Program Files\Eclipse Adoptium\*\bin\javaw.exe" -ErrorAction SilentlyContinue
+                      $roots = @(
+                          "C:\Users\RDP\AppData\Roaming\.minecraft\runtime",
+                          "C:\Program Files (x86)\Minecraft Launcher\runtime",
+                          "C:\Program Files\Minecraft Launcher\runtime",
+                          "C:\Users\RDP\AppData\Local\Packages\Microsoft.4297127D64EC6_8wekyb3d8bbwe",
+                          "C:\Program Files\Eclipse Adoptium"
+                      )
+                      foreach ($r in $roots) {
+                          if (Test-Path $r) { $found += Get-ChildItem $r -Recurse -File -Include javaw.exe,java.exe -ErrorAction SilentlyContinue }
+                      }
+                      $found.FullName | Set-Content "C:\Users\Public\mesa-found.txt"
+                      # (Adoptium صار ضمن القائمة أعلاه)
                       foreach ($j in $found) {
                           foreach ($f in $files) {
                               $t = Join-Path $j.DirectoryName $f
