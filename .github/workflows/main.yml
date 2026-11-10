@@ -21,7 +21,7 @@ jobs:
       # برامج تُثبَّت تلقائيا كل جلسة (أسماء حزم Chocolatey) مفصولة بفاصلة
       APPS: "googlechrome,7zip,vlc,winrar,temurin21,minecraft-launcher"
       # مجلدات إضافية تُحفظ (داخل C:\Users\RDP). Apps = مجلد لبرامجك المحمولة
-      APP_DATA_FOLDERS: 'Apps,AppData\Roaming,AppData\Local\Programs'
+      APP_DATA_FOLDERS: 'Apps,AppData\Roaming,AppData\Local\Programs,AppData\Local\Microsoft\Edge\User Data'
 
     steps:
       - name: Configure Core RDP Settings
@@ -160,6 +160,24 @@ jobs:
           [Environment]::SetEnvironmentVariable('GALLIUM_DRIVER', 'llvmpipe', 'Machine')
           Write-Host "Mesa ready"
 
+      - name: Install SKlauncher
+        continue-on-error: true
+        run: |
+          $base = "https://skmedix.pl/downloads"
+          $resp = Invoke-WebRequest $base -UseBasicParsing
+          $hrefs = @($resp.Links.href | Where-Object { $_ -match '\.exe($|\?)' })
+          Write-Host "Links found:"; $hrefs | ForEach-Object { Write-Host "  $_" }
+          $pick = $hrefs | Where-Object { $_ -match 'setup|install|sklauncher' } | Select-Object -First 1
+          if (-not $pick) { $pick = $hrefs | Select-Object -First 1 }
+          if (-not $pick) { Write-Error "No .exe link found on $base"; exit 1 }
+          $url = [Uri]::new([Uri]$base, $pick).AbsoluteUri
+          Write-Host "Downloading: $url"
+          $f = "$env:TEMP\SKlauncher-setup.exe"
+          Invoke-WebRequest $url -OutFile $f -UseBasicParsing
+          Write-Host ("Downloaded {0} MB" -f [math]::Round((Get-Item $f).Length / 1MB, 1))
+          Start-Process $f -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/ALLUSERS' -Wait
+          Write-Host "SKlauncher installer finished (exit $LASTEXITCODE)"
+
       - name: Prepare backup script
         run: |
           @'
@@ -176,7 +194,7 @@ jobs:
           foreach ($f in $folders) {
               if (Test-Path "$src\$f") {
                   robocopy "$src\$f" "$stage\$f" /E /R:0 /W:0 /NFL /NDL /NJH /NJS /NP `
-                    /XD Cache "Code Cache" GPUCache Crashpad "Service Worker" "Component_CRX_Cache" CachedData Temp Microsoft `
+                    /XD Cache "Code Cache" GPUCache Crashpad "Service Worker" "Component_CRX_Cache" CachedData DawnCache GrShaderCache ShaderCache Temp Microsoft `
                     /XF opengl32.dll libgallium_wgl.dll libglapi.dll | Out-Null
               }
           }
@@ -298,22 +316,25 @@ jobs:
 
                       # تثبيت التطبيقات تلقائيا داخل حساب RDP (إذا لم تكن موجودة)
                       $lines = @(
+                        'if (Test-Path "C:\Users\Public\apps_done.flag") { exit }',
+                        'Start-Transcript -Path "C:\Users\Public\apps.log" -Force | Out-Null',
                         '$dl = "$env:TEMP\appdl"; New-Item -ItemType Directory $dl -Force | Out-Null',
                         'function Get-App($url, $name) { try { Invoke-WebRequest $url -OutFile "$dl\$name" -UseBasicParsing; return "$dl\$name" } catch { Write-Host "Download failed: $name"; return $null } }',
                         'Remove-Item "$env:LOCALAPPDATA\Discord" -Recurse -Force -ErrorAction SilentlyContinue',
                         '$f = Get-App "https://discord.com/api/download?platform=win" "DiscordSetup.exe"; if ($f) { Start-Process $f -ArgumentList "-s" -Wait }',
+                        'if (-not (Test-Path "$env:LOCALAPPDATA\Discord\Update.exe")) { Set-Content -Path "$env:USERPROFILE\Desktop\Discord Web.url" -Value "[InternetShortcut]`nURL=https://discord.com/app" }',
                         'if (-not (Test-Path "$env:APPDATA\Spotify\Spotify.exe")) { $f = Get-App "https://download.scdn.co/SpotifySetup.exe" "SpotifySetup.exe"; if ($f) { Start-Process $f -ArgumentList "/silent" -Wait } }',
                         'Set-Content -Path "$env:USERPROFILE\Desktop\Claude.url" -Value "[InternetShortcut]`nURL=https://claude.ai"',
                         'Set-Content -Path "$env:USERPROFILE\Desktop\WhatsApp Web.url" -Value "[InternetShortcut]`nURL=https://web.whatsapp.com"',
+                        'New-Item -ItemType File "C:\Users\Public\apps_done.flag" -Force | Out-Null',
                         'Write-Host "apps done"'
                       )
                       $lines | Set-Content -Path "C:\Users\Public\apps.ps1" -Encoding UTF8
-                      try {
-                          $cred = New-Object System.Management.Automation.PSCredential(".\RDP", (ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force))
-                          Start-Process powershell -Credential $cred -LoadUserProfile -WorkingDirectory "C:\Users\Public" -WindowStyle Hidden `
-                            -RedirectStandardOutput "C:\Users\Public\apps.log" -ArgumentList "-ExecutionPolicy Bypass -File C:\Users\Public\apps.ps1"
-                          Write-Host "App installer started in background for user RDP"
-                      } catch { Write-Host "Could not start app installer: $($_.Exception.Message)" }
+                      # يشتغل تلقائيا عند دخولك بـ RDP (داخل جلستك الحقيقية) بدل تشغيله من الخلفية
+                      if (-not (Test-Path $startupPath)) { New-Item -ItemType Directory -Path $startupPath -Force | Out-Null }
+                      Set-Content -Path "$startupPath\apps.cmd" -Encoding ASCII `
+                        -Value 'powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\Users\Public\apps.ps1'
+                      Write-Host "App installer will run when RDP user logs in"
 
                       if (-not (Test-Path $startupPath)) {
                           New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
