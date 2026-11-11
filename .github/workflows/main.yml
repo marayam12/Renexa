@@ -177,6 +177,15 @@ jobs:
               $base = "https://skmedix.pl/downloads"
               $resp = Invoke-WebRequest $base -UseBasicParsing
               $all = @($resp.Links.href | Where-Object { $_ } | Select-Object -Unique)
+              # روابط التحميل تكون غالبا داخل الجافاسكربت، فنفحص نص الصفحة وملفات JS المرتبطة بها
+              $texts = @($resp.Content)
+              foreach ($m in [regex]::Matches($resp.Content, '<script[^>]+src="([^"]+)"')) {
+                  try { $texts += (Invoke-WebRequest ([Uri]::new([Uri]$base, $m.Groups[1].Value).AbsoluteUri) -UseBasicParsing).Content } catch {}
+              }
+              $embedded = @($texts | ForEach-Object { [regex]::Matches($_, '(?:https?:)?//[^\s<>"\x27\\]+\.(?:exe|msi|jar)|(?<=["\x27])/[^\s<>"\x27\\]+\.(?:exe|msi|jar)') } | ForEach-Object { $_.Value } | Select-Object -Unique)
+              Write-Host "Embedded file links ($($embedded.Count)):"
+              $embedded | ForEach-Object { Write-Host "  $_" }
+              $all = @($embedded) + $all
               Write-Host "Page links ($($all.Count)):"
               $all | ForEach-Object { Write-Host "  $_" }
               $cands = $all | Where-Object { $_ -match 'setup|\.exe|download|windows|win' }
