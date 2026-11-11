@@ -219,12 +219,24 @@ jobs:
           $global:LASTEXITCODE = 0
           if (-not (Get-ChildItem $stage -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1)) { Write-Host "Nothing to back up - skipped"; exit 0 }
 
+          # إذا كان الحجم كبيرا: نحذف أكبر الملفات فقط (من النسخة) ونحفظ الباقي، بدل تخطي النسخة كلها
+          $limitMB = 2000
+          $files = Get-ChildItem $stage -Recurse -File -ErrorAction SilentlyContinue | Sort-Object Length -Descending
+          $total = ($files | Measure-Object Length -Sum).Sum / 1MB
+          Write-Host ("Total to back up: {0} MB" -f [math]::Round($total, 1))
+          foreach ($x in $files) {
+              if ($total -le $limitMB) { break }
+              Write-Host ("Too big - not backed up: {0} ({1} MB)" -f $x.FullName.Substring($stage.Length), [math]::Round($x.Length / 1MB))
+              Remove-Item $x.FullName -Force -ErrorAction SilentlyContinue
+              $total -= $x.Length / 1MB
+          }
+
           tar -a -c -f $zip -C $stage .
           $global:LASTEXITCODE = 0
           if (-not (Test-Path $zip)) { Write-Host "No zip created"; exit 0 }
 
           $mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
-          if ($mb -gt 1900) { Write-Host "Backup is $mb MB (limit ~2000 MB) - skipped"; exit 0 }
+          if ($mb -gt 2040) { Write-Host "Backup is $mb MB (GitHub limit 2048 MB) - skipped"; exit 0 }
 
           $env:GH_TOKEN = $env:DATA_TOKEN
           gh release view data --repo $env:DATA_REPO *> $null
