@@ -163,20 +163,36 @@ jobs:
       - name: Install SKlauncher
         continue-on-error: true
         run: |
-          $base = "https://skmedix.pl/downloads"
-          $resp = Invoke-WebRequest $base -UseBasicParsing
-          $hrefs = @($resp.Links.href | Where-Object { $_ -match '\.exe($|\?)' })
-          Write-Host "Links found:"; $hrefs | ForEach-Object { Write-Host "  $_" }
-          $pick = $hrefs | Where-Object { $_ -match 'setup|install|sklauncher' } | Select-Object -First 1
-          if (-not $pick) { $pick = $hrefs | Select-Object -First 1 }
-          if (-not $pick) { Write-Error "No .exe link found on $base"; exit 1 }
-          $url = [Uri]::new([Uri]$base, $pick).AbsoluteUri
-          Write-Host "Downloading: $url"
           $f = "$env:TEMP\SKlauncher-setup.exe"
-          Invoke-WebRequest $url -OutFile $f -UseBasicParsing
-          Write-Host ("Downloaded {0} MB" -f [math]::Round((Get-Item $f).Length / 1MB, 1))
+          $ok = $false
+
+          # 1) من GitHub Releases الخاصة بالمستودع (أحدث إصدار، أي ملف exe)
+          Remove-Item "$env:TEMP\sk" -Recurse -Force -ErrorAction SilentlyContinue
+          gh release download --repo sklauncher/installer --pattern "*.exe" --dir "$env:TEMP\sk" --clobber 2>&1 | Write-Host
+          $g = Get-ChildItem "$env:TEMP\sk" -Filter *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($g) { Copy-Item $g.FullName $f -Force; $ok = $true; Write-Host "Installer from GitHub release: $($g.Name)" }
+
+          # 2) إن لم يوجد: نبحث في صفحة التحميل الرسمية
+          if (-not $ok) {
+              $base = "https://skmedix.pl/downloads"
+              $resp = Invoke-WebRequest $base -UseBasicParsing
+              $all = @($resp.Links.href | Where-Object { $_ } | Select-Object -Unique)
+              Write-Host "Page links ($($all.Count)):"
+              $all | ForEach-Object { Write-Host "  $_" }
+              $cands = $all | Where-Object { $_ -match 'setup|\.exe|download|windows|win' }
+              foreach ($c in $cands) {
+                  $url = [Uri]::new([Uri]$base, $c).AbsoluteUri
+                  try {
+                      Invoke-WebRequest $url -OutFile $f -UseBasicParsing -ErrorAction Stop
+                      $fs = [IO.File]::OpenRead($f); $b = New-Object byte[] 2; $null = $fs.Read($b, 0, 2); $fs.Close()
+                      if ($b[0] -eq 0x4D -and $b[1] -eq 0x5A -and (Get-Item $f).Length -gt 1MB) { Write-Host "Installer found: $url"; $ok = $true; break }
+                  } catch { Write-Host "Skipped: $url" }
+              }
+          }
+
+          if (-not $ok) { Write-Error "No installer found - send me the full download link"; exit 1 }
           Start-Process $f -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/ALLUSERS' -Wait
-          Write-Host "SKlauncher installer finished (exit $LASTEXITCODE)"
+          Write-Host "SKlauncher installer finished"
 
       - name: Prepare backup script
         run: |
@@ -194,8 +210,10 @@ jobs:
           foreach ($f in $folders) {
               if (Test-Path "$src\$f") {
                   robocopy "$src\$f" "$stage\$f" /E /R:0 /W:0 /NFL /NDL /NJH /NJS /NP `
-                    /XD Cache "Code Cache" GPUCache Crashpad "Service Worker" "Component_CRX_Cache" CachedData DawnCache GrShaderCache ShaderCache Temp Microsoft `
+                    /XD Cache "Code Cache" GPUCache Crashpad "Service Worker" "Component_CRX_Cache" CachedData DawnCache GrShaderCache ShaderCache Temp Microsoft "$src\AppData\Roaming\.minecraft\assets" "$src\AppData\Roaming\.minecraft\libraries" "$src\AppData\Roaming\.minecraft\runtime" `
                     /XF opengl32.dll libgallium_wgl.dll libglapi.dll | Out-Null
+                  $sz = (Get-ChildItem "$stage\$f" -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+                  Write-Host ("  {0}: {1} MB" -f $f, [math]::Round($sz / 1MB, 1))
               }
           }
           $global:LASTEXITCODE = 0
@@ -370,6 +388,9 @@ jobs:
       - name: Final backup
         if: always() && steps.keep.conclusion != 'skipped'
         run: |
+          # نغلق المتصفحات أولا حتى تُنسخ ملفاتها كاملة (الملفات المفتوحة قد تُتخطى)
+          Get-Process msedge, chrome, firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
           if (Test-Path "$env:RUNNER_TEMP\backup.ps1") { & "$env:RUNNER_TEMP\backup.ps1" }
 
       - name: Restart workflow (new session)
