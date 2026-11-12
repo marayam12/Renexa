@@ -19,9 +19,9 @@ jobs:
       DATA_REPO: marayam12/renexa-data
       DATA_TOKEN: ${{ secrets.DATA_TOKEN }}
       # برامج تُثبَّت تلقائيا كل جلسة (أسماء حزم Chocolatey) مفصولة بفاصلة
-      APPS: "googlechrome,7zip,vlc,winrar,temurin21,minecraft-launcher"
+      APPS: "googlechrome,7zip,vlc,winrar,temurin21,minecraft-launcher,vscode"
       # مجلدات إضافية تُحفظ (داخل C:\Users\RDP). Apps = مجلد لبرامجك المحمولة
-      APP_DATA_FOLDERS: 'Apps,AppData\Roaming,AppData\Local\Programs,AppData\Local\Microsoft\Edge\User Data'
+      APP_DATA_FOLDERS: 'Apps,AppData\Roaming,AppData\Local\Programs,AppData\Local\Microsoft\Edge\User Data,.vscode'
 
     steps:
       - name: Configure Core RDP Settings
@@ -228,16 +228,26 @@ jobs:
           $global:LASTEXITCODE = 0
           if (-not (Get-ChildItem $stage -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1)) { Write-Host "Nothing to back up - skipped"; exit 0 }
 
-          # إذا كان الحجم كبيرا: نحذف أكبر الملفات فقط (من النسخة) ونحفظ الباقي، بدل تخطي النسخة كلها
+          # إذا تجاوز الحجم الحد: نتخطى "الوحدات" الأثقل كاملة (تطبيق / مجلد / ملف) ونحفظ الباقي الخفيف
           $limitMB = 2000
-          $files = Get-ChildItem $stage -Recurse -File -ErrorAction SilentlyContinue | Sort-Object Length -Descending
-          $total = ($files | Measure-Object Length -Sum).Sum / 1MB
-          Write-Host ("Total to back up: {0} MB" -f [math]::Round($total, 1))
-          foreach ($x in $files) {
+          $expand = @('.minecraft', 'extensions')   # هذه المجلدات تُقسَّم لوحدات أصغر (عوالم، إضافات...)
+          function Get-Units($path) {
+              foreach ($c in Get-ChildItem $path -Force -ErrorAction SilentlyContinue) {
+                  if ($c.PSIsContainer -and ($expand -contains $c.Name)) { Get-Units $c.FullName } else { $c }
+              }
+          }
+          $units = foreach ($f in $folders) { if (Test-Path "$stage\$f") { Get-Units "$stage\$f" } }
+          $sized = @($units | ForEach-Object {
+              $sz = if ($_.PSIsContainer) { (Get-ChildItem $_.FullName -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum } else { $_.Length }
+              [pscustomobject]@{ Path = $_.FullName; Size = [int64]$sz }
+          })
+          $total = ($sized | Measure-Object Size -Sum).Sum / 1MB
+          Write-Host ("Total to back up: {0} MB (limit {1} MB)" -f [math]::Round($total, 1), $limitMB)
+          foreach ($u in ($sized | Sort-Object Size -Descending)) {
               if ($total -le $limitMB) { break }
-              Write-Host ("Too big - not backed up: {0} ({1} MB)" -f $x.FullName.Substring($stage.Length), [math]::Round($x.Length / 1MB))
-              Remove-Item $x.FullName -Force -ErrorAction SilentlyContinue
-              $total -= $x.Length / 1MB
+              Write-Host ("Too heavy - NOT backed up: {0} ({1} MB)" -f $u.Path.Substring($stage.Length), [math]::Round($u.Size / 1MB))
+              Remove-Item $u.Path -Recurse -Force -ErrorAction SilentlyContinue
+              $total -= $u.Size / 1MB
           }
 
           tar -a -c -f $zip -C $stage .
@@ -361,7 +371,8 @@ jobs:
                         'function Get-App($url, $name) { try { Invoke-WebRequest $url -OutFile "$dl\$name" -UseBasicParsing; return "$dl\$name" } catch { Write-Host "Download failed: $name"; return $null } }',
                         'Remove-Item "$env:LOCALAPPDATA\Discord" -Recurse -Force -ErrorAction SilentlyContinue',
                         '$f = Get-App "https://discord.com/api/download?platform=win" "DiscordSetup.exe"; if ($f) { Start-Process $f -ArgumentList "-s" -Wait }',
-                        'if (-not (Test-Path "$env:LOCALAPPDATA\Discord\Update.exe")) { Set-Content -Path "$env:USERPROFILE\Desktop\Discord Web.url" -Value "[InternetShortcut]`nURL=https://discord.com/app" }',
+                        '$t = 0; while (-not (Get-ChildItem "$env:LOCALAPPDATA\Discord\app-*\Discord.exe" -ErrorAction SilentlyContinue) -and $t -lt 36) { Start-Sleep -Seconds 5; $t++ }',
+                        'Write-Host ("Discord installed: " + [bool](Get-ChildItem "$env:LOCALAPPDATA\Discord\app-*\Discord.exe" -ErrorAction SilentlyContinue))',
                         'if (-not (Test-Path "$env:APPDATA\Spotify\Spotify.exe")) { $f = Get-App "https://download.scdn.co/SpotifySetup.exe" "SpotifySetup.exe"; if ($f) { Start-Process $f -ArgumentList "/silent" -Wait } }',
                         'Set-Content -Path "$env:USERPROFILE\Desktop\Claude.url" -Value "[InternetShortcut]`nURL=https://claude.ai"',
                         'Set-Content -Path "$env:USERPROFILE\Desktop\WhatsApp Web.url" -Value "[InternetShortcut]`nURL=https://web.whatsapp.com"',
